@@ -1,10 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<link rel="preconnect" href="https://backend.multistreaming.site" crossorigin>
-<link rel="dns-prefetch" href="https://backend.multistreaming.site">
-<link rel="preconnect" href="https://gdgoenkaratia.com" crossorigin>
-<link rel="dns-prefetch" href="https://gdgoenkaratia.com">
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>DoraWay · Premium Dashboard</title>
@@ -1305,11 +1301,7 @@ let currentQualityIdx = 0;
 let currentRec = null; // the mp4Recordings entry currently loaded (for retry / open-externally)
 let loadWatchdog = null;
 let currentPlaybackRate = 1;
-let autoRetryCount = 0;        // how many silent auto-retries we've done for the CURRENT video
-const AUTO_RETRY_MAX = 2;      // silently retry twice (like a manual reload would) before showing the error box
-const AUTO_RETRY_DELAY = 1200; // ms between silent retries
 window._videoRegistry = {};
-window._preconnectedOrigins = {};
 
 // ── Debounce helper for smooth search ──
 function debounce(func, wait) {
@@ -1983,7 +1975,6 @@ function openPlayer(item){
 function closePlayer(){
   const video=document.getElementById('main-video');
   clearTimeout(loadWatchdog);
-  autoRetryCount=0;
   hidePlayerError();
   try{ video.pause(); }catch(e){}
   video.removeAttribute('src'); video.load();
@@ -1994,20 +1985,16 @@ function closePlayer(){
 }
 
 // ══════════════════ VIDEO SOURCE / QUALITY ══════════════════
-function loadVideoSource(rec, qualIdx, resumeTime, isSilentRetry){
+function loadVideoSource(rec, qualIdx, resumeTime){
   const video=document.getElementById('main-video');
   currentQualityIdx=qualIdx;
   currentRec=rec;
   const resume=(resumeTime!=null&&resumeTime>0.5)?resumeTime:0;
 
-  if(!isSilentRetry) autoRetryCount=0; // fresh video / fresh manual retry resets the silent-retry budget
-
   hidePlayerError();
   clearTimeout(loadWatchdog);
-  preconnectToVideoOrigin(rec.url);
 
   video.pause();
-  video.removeAttribute('src'); video.load(); // hard-reset the element before assigning a new source
   video.setAttribute('referrerpolicy','no-referrer');
   video.src=rec.url;
   video.playbackRate=currentPlaybackRate;
@@ -2037,53 +2024,12 @@ function loadVideoSource(rec, qualIdx, resumeTime, isSilentRetry){
   document.getElementById('curQualityLabel').innerHTML=esc(rec.quality)+' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="9 18 15 12 9 6"/></svg>';
   document.querySelectorAll('#qualityOptionsList .settings-option').forEach((el,i)=>el.classList.toggle('active',i===qualIdx));
 
-  // Watchdog: if nothing has loaded in 12s (bad URL / blocked / slow first connection), silently
-  // retry a couple of times first (this is exactly what a manual page reload was doing before),
-  // and only show the error box if it still hasn't loaded after those retries.
+  // Watchdog: if nothing has loaded in 12s (bad URL / blocked / no network), show a clear error + fallback.
   loadWatchdog=setTimeout(()=>{
     if(video.readyState<2){
-      handleLoadFailure('Video is taking too long to load.', buildVideoDebugInfo(video, rec.url));
+      showPlayerError('Video is taking too long to load.', buildVideoDebugInfo(video, rec.url));
     }
   },12000);
-}
-
-// Called on both the watchdog timeout and a real <video> error event.
-// Silently retries the same source (mimicking what a manual reload used to fix)
-// before finally surfacing the error box to the user.
-function handleLoadFailure(msg, debugInfo){
-  if(!currentRec) return;
-  if(autoRetryCount<AUTO_RETRY_MAX){
-    autoRetryCount++;
-    document.getElementById('bufferRing').classList.add('show');
-    const rec=currentRec, qualIdx=currentQualityIdx;
-    const video=document.getElementById('main-video');
-    const resumeAt=video.currentTime||0;
-    setTimeout(()=>{
-      // Only retry if the user hasn't closed the player or switched video in the meantime.
-      if(document.getElementById('video-overlay').classList.contains('open') && currentRec===rec){
-        loadVideoSource(rec, qualIdx, resumeAt, true);
-      }
-    }, AUTO_RETRY_DELAY);
-  } else {
-    showPlayerError(msg, debugInfo);
-  }
-}
-
-// Warm up the connection to the video CDN as soon as we know the URL, so the *first*
-// real request (the one triggered by the user's tap) isn't also paying for DNS/TLS setup.
-function preconnectToVideoOrigin(url){
-  try{
-    const origin=new URL(url, window.location.href).origin;
-    if(window._preconnectedOrigins[origin]) return;
-    window._preconnectedOrigins[origin]=true;
-    ['preconnect','dns-prefetch'].forEach(rel=>{
-      const link=document.createElement('link');
-      link.rel=rel;
-      link.href=origin;
-      link.crossOrigin='anonymous';
-      document.head.appendChild(link);
-    });
-  }catch(e){}
 }
 
 function buildVideoDebugInfo(video, url){
@@ -2121,7 +2067,19 @@ function retryCurrentVideo(){
   loadVideoSource(currentRec, currentQualityIdx, video.currentTime||0);
 }
 function openCurrentVideoExternally(){
-  if(currentRec&&currentRec.url) openLink(currentRec.url);
+  if(!currentRec||!currentRec.url) return;
+
+  const url=currentRec.url;
+
+  // Android Intent (MX Player / VLC / default video apps)
+  const intentUrl='intent:'+url.replace(/^https?:\/\//,'')+
+    '#Intent;action=android.intent.action.VIEW;type=video/*;end';
+
+  try{
+    window.location.href=intentUrl;
+  }catch(e){
+    window.open(url,'_blank');
+  }
 }
 
 function buildQualityOptions(recs){
@@ -2290,6 +2248,7 @@ document.addEventListener('fullscreenchange', ()=>{
   });
   video.addEventListener('error', ()=>{
     clearTimeout(loadWatchdog);
+    document.getElementById('bufferRing').classList.remove('show');
     let msg="This video couldn't be played here.";
     const err=video.error;
     if(err){
@@ -2297,9 +2256,10 @@ document.addEventListener('fullscreenchange', ()=>{
       else if(err.code===4) msg="This video format/link isn't supported by the browser player.";
       else if(err.code===2) msg='Network error while loading the video.';
     }
-    // Don't show the error box on the very first failure — silently retry first,
-    // same as what a manual page reload used to do.
-    handleLoadFailure(msg, buildVideoDebugInfo(video, currentRec?currentRec.url:''));
+    showPlayerError(msg, buildVideoDebugInfo(video, currentRec?currentRec.url:''));
+    if(currentRec&&currentRec.url){
+      window.open(currentRec.url,'_blank');
+    }
   });
 
   // Auto-hide controls while playing
